@@ -1,3 +1,16 @@
+# ===== Patch for Python 3.13 =====
+# This ensures old libraries like python-telegram-bot==13.15 can still import imghdr
+import sys
+import types
+
+if "imghdr" not in sys.modules:
+    imghdr = types.ModuleType("imghdr")
+    def what(file, h=None):
+        return None
+    imghdr.what = what
+    sys.modules["imghdr"] = imghdr
+# =================================
+
 import os
 import logging
 import threading
@@ -84,7 +97,7 @@ class CryptoMonitor:
 
     def fetch_candles(self, exchange, symbol):
         try:
-            import pandas as pd  # lazy import
+            import pandas as pd
             candles = exchange.fetch_ohlcv(symbol, timeframe=TIMEFRAME, limit=5)
             df = pd.DataFrame(candles, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
             df['timestamp'] = pd.to_datetime(df['timestamp'], unit='ms')
@@ -123,7 +136,7 @@ class CryptoMonitor:
                 hot_pairs = [sym for sym, data in tickers.items()
                              if sym.endswith('/USDT') and data.get('percentage') is not None and abs(data['percentage']) > 1]
 
-                logger.info(f"Hot pairs found: {len(hot_pairs)}")
+                logger.info(f"Hot pairs: {len(hot_pairs)}")
                 for symbol in hot_pairs:
                     df = self.fetch_candles(exchange, symbol)
                     if df is None:
@@ -196,7 +209,7 @@ def api_price_data():
 def ping():
     return "pong"
 
-# --- Start bot ---
+# --- Start Bot ---
 crypto_monitor = CryptoMonitor(
     telegram_token=TELEGRAM_TOKEN,
     telegram_chat_id=TELEGRAM_CHAT_ID,
