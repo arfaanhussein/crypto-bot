@@ -10,24 +10,23 @@ import os
 import logging
 import threading
 import time
+import sqlite3
 from datetime import datetime
 from flask import Flask, jsonify
-from flask_sqlalchemy import SQLAlchemy
-from sqlalchemy.orm import DeclarativeBase
 from werkzeug.middleware.proxy_fix import ProxyFix
 import ccxt
 from telegram import Bot
 
-# Config
+# --- Config ---
 TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN", "8384498061:AAElt7HeM88jfune948IcKkysHpw1tmXrlc")
 TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "1040990874")
 
 TIMEFRAME = "1h"
-CHECK_INTERVAL = 300  # seconds
+CHECK_INTERVAL = 300
 MIN_GREEN_CANDLES = 4
 MAX_GREEN_CANDLES = 9
 BREAKOUT_THRESHOLD = 0.01
-TOP_N = 15  # limit pairs checked in-depth to avoid API bans
+TOP_N = 15
 
 # --- Logging ---
 logging.basicConfig(
@@ -37,37 +36,36 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-# --- Database ---
-class Base(DeclarativeBase):
-    pass
+# --- SQLite Setup ---
+conn = sqlite3.connect("alerts.db", check_same_thread=False)
+cursor = conn.cursor()
+cursor.execute("""
+CREATE TABLE IF NOT EXISTS alerts (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    message TEXT,
+    timestamp TEXT,
+    price REAL,
+    green_candles INTEGER,
+    breakout_probability REAL
+)
+""")
+conn.commit()
 
-db = SQLAlchemy(model_class=Base)
-app = Flask(__name__)
-app.secret_key = "dev-secret"
-app.wsgi_app = ProxyFix(app.wsgi_app, x_proto=1, x_host=1)
-app.config["SQLALCHEMY_DATABASE_URI"] = "sqlite:///crypto_bot.db"
-db.init_app(app)
+def save_alert(message, price, green_candles, probability):
+    cursor.execute(
+        "INSERT INTO alerts (message, timestamp, price, green_candles, breakout_probability) VALUES (?, ?, ?, ?, ?)",
+        (message, datetime.utcnow().isoformat(), price, green_candles, probability)
+    )
+    conn.commit()
 
-from sqlalchemy import Column, Integer, Float, String, DateTime
-class Alert(db.Model):
-    id = Column(Integer, primary_key=True)
-    message = Column(String, nullable=False)
-    timestamp = Column(DateTime, default=datetime.utcnow)
-    price = Column(Float)
-    green_candles = Column(Integer)
+def get_recent_alerts(limit=10):
+    cursor.execute(
+        "SELECT id, message, timestamp, price, green_candles, breakout_probability FROM alerts ORDER BY id DESC LIMIT ?",
+        (limit,)
+    )
+    return cursor.fetchall()
 
-with app.app_context():
-    db.create_all()
-
-bot_status = {
-    'is_running': False,
-    'last_check': None,
-    'alerts_sent': 0,
-    'last_alert': None,
-    'errors': []
-}
-
-# === Indicator Functions (No pandas) ===
+# --- Indicator Functions ---
 def calculate_atr(candles, period=5):
     if len(candles) < period + 1:
         return 0
@@ -107,7 +105,7 @@ def near_resistance(candles, lookback=20, tolerance=0.003):
     resistance = max(c["close"] for c in candles[-lookback-1:-1])
     return candles[-1]["close"] >= resistance * (1 - tolerance)
 
-# === Bot Class ===
+# --- Bot Class ---
 class CryptoMonitor:
     def __init__(self, telegram_token, telegram_chat_id, status_callback):
         self.bot = Bot(token=telegram_token)
@@ -164,14 +162,22 @@ class CryptoMonitor:
         except Exception as e:
             logger.error(f"Telegram send error: {e}")
 
+    # New ML-lite probability scoring
+    def calculate_breakout_probability(self, green_streak, vol_surge, atr_now, atr_prev, rsi_now, res_break):
+        score = 0
+        if MIN_GREEN_CANDLES <= green_streak <= MAX_GREEN_CANDLES: score += 2
+        if vol_surge: score += 2
+        if atr_now > atr_prev: score += 1
+        if 55 < rsi_now < 75: score += 1
+        if res_break: score += 2
+        return round(score / 8, 2)
+
     def start_monitoring(self):
         logger.info("CryptoMonitor started")
         bot_status['is_running'] = True
-
         while True:
             try:
                 exchange, tickers = self.fetch_tickers_with_fallback()
-                # Top-N movers filter
                 candidates = [
                     (sym, data.get('percentage', 0))
                     for sym, data in tickers.items()
@@ -194,26 +200,18 @@ class CryptoMonitor:
                         rsi_now = calculate_rsi(candles)
                         res_break = near_resistance(candles)
 
-                        if vol_surge and atr_now > atr_prev and 55 < rsi_now < 75 and res_break:
-                            prob = "HIGH"
-                        else:
-                            prob = "LOW"
+                        probability = self.calculate_breakout_probability(
+                            green_streak, vol_surge, atr_now, atr_prev, rsi_now, res_break
+                        )
 
                         msg = (f"{symbol}: {green_streak} green candles ({TIMEFRAME})\n"
                                f"Current: ${candles[-1]['close']:,.2f}\n"
                                f"ATR: {atr_now:.4f}, RSI: {rsi_now:.2f}\n"
                                f"Volume Surge: {vol_surge}, Near Resistance: {res_break}\n"
-                               f"Breakout Probability: {prob}")
+                               f"Breakout Probability Score: {probability}")
 
                         self.send_alert(msg)
-                        with app.app_context():
-                            alert = Alert(
-                                message=msg,
-                                price=candles[-1]['close'],
-                                green_candles=green_streak
-                            )
-                            db.session.add(alert)
-                            db.session.commit()
+                        save_alert(msg, candles[-1]['close'], green_streak, probability)
                         bot_status['alerts_sent'] += 1
                         bot_status['last_alert'] = msg
 
@@ -228,11 +226,22 @@ class CryptoMonitor:
                 bot_status['errors'].append(str(e))
                 time.sleep(CHECK_INTERVAL)
 
-# === Status Callback ===
+# --- Status Callback ---
+bot_status = {
+    'is_running': False,
+    'last_check': None,
+    'alerts_sent': 0,
+    'last_alert': None,
+    'errors': []
+}
 def update_status(status_update):
     bot_status.update(status_update)
 
-# === Flask Routes ===
+# --- Flask App ---
+app = Flask(__name__)
+app.secret_key = "dev-secret"
+app.wsgi_app = ProxyFix(app.wsgi_app, x_proto=1, x_host=1)
+
 @app.route('/')
 def index():
     return jsonify(bot_status)
@@ -243,14 +252,18 @@ def api_status():
 
 @app.route('/api/alerts')
 def api_alerts():
-    alerts = Alert.query.order_by(Alert.timestamp.desc()).limit(10).all()
-    return jsonify([{
-        'id': a.id,
-        'message': a.message,
-        'timestamp': a.timestamp.isoformat(),
-        'price': a.price,
-        'green_candles': a.green_candles
-    } for a in alerts])
+    rows = get_recent_alerts()
+    return jsonify([
+        {
+            'id': r[0],
+            'message': r[1],
+            'timestamp': r[2],
+            'price': r[3],
+            'green_candles': r[4],
+            'breakout_probability': r[5]
+        }
+        for r in rows
+    ])
 
 @app.route('/api/price_data')
 def api_price_data():
@@ -269,7 +282,7 @@ def api_price_data():
 def ping():
     return "pong"
 
-# === Start Bot ===
+# --- Start Bot ---
 crypto_monitor = CryptoMonitor(
     telegram_token=TELEGRAM_TOKEN,
     telegram_chat_id=TELEGRAM_CHAT_ID,
