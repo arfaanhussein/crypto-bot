@@ -1,4 +1,5 @@
 ccxt==4.2.41
 python-telegram-bot==13.15
+urllib3==1.26.15
 flask==2.3.3
 requests==2.31.0
