@@ -1,15 +1,10 @@
-# ===== Patch for Python 3.13 =====
-# This ensures old libraries like python-telegram-bot==13.15 can still import imghdr
-import sys
-import types
-
+# ===== Patch for Python 3.13 imghdr removal =====
+import sys, types
 if "imghdr" not in sys.modules:
     imghdr = types.ModuleType("imghdr")
-    def what(file, h=None):
-        return None
-    imghdr.what = what
+    imghdr.what = lambda file, h=None: None
     sys.modules["imghdr"] = imghdr
-# =================================
+# ================================================
 
 import os
 import logging
@@ -28,10 +23,11 @@ TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN", "8384498061:AAElt7HeM88jfune94
 TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "1040990874")
 
 TIMEFRAME = "1h"
-CHECK_INTERVAL = 300
+CHECK_INTERVAL = 300  # seconds
 MIN_GREEN_CANDLES = 4
 MAX_GREEN_CANDLES = 9
 BREAKOUT_THRESHOLD = 0.01
+TOP_N = 15  # limit pairs checked in-depth to avoid API bans
 
 # --- Logging ---
 logging.basicConfig(
@@ -41,7 +37,7 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-# --- DB Setup ---
+# --- Database ---
 class Base(DeclarativeBase):
     pass
 
@@ -71,14 +67,54 @@ bot_status = {
     'errors': []
 }
 
-# --- Bot ---
+# === Indicator Functions (No pandas) ===
+def calculate_atr(candles, period=5):
+    if len(candles) < period + 1:
+        return 0
+    trs = []
+    for i in range(1, period + 1):
+        high = candles[-i]["high"]
+        low = candles[-i]["low"]
+        prev_close = candles[-i-1]["close"]
+        tr = max(high - low, abs(high - prev_close), abs(low - prev_close))
+        trs.append(tr)
+    return sum(trs) / period
+
+def calculate_rsi(candles, period=14):
+    if len(candles) < period + 1:
+        return 50
+    gains, losses = 0, 0
+    for i in range(-period, 0):
+        change = candles[i]["close"] - candles[i-1]["close"]
+        if change > 0:
+            gains += change
+        else:
+            losses -= change
+    if losses == 0:
+        return 100
+    rs = gains / losses
+    return 100 - (100 / (1 + rs))
+
+def calculate_volume_surge(candles, lookback=5, surge_factor=1.5):
+    if len(candles) < lookback:
+        return False
+    avg_vol = sum(c["volume"] for c in candles[-lookback-1:-1]) / lookback
+    return candles[-1]["volume"] > avg_vol * surge_factor
+
+def near_resistance(candles, lookback=20, tolerance=0.003):
+    if len(candles) < lookback:
+        return False
+    resistance = max(c["close"] for c in candles[-lookback-1:-1])
+    return candles[-1]["close"] >= resistance * (1 - tolerance)
+
+# === Bot Class ===
 class CryptoMonitor:
     def __init__(self, telegram_token, telegram_chat_id, status_callback):
         self.bot = Bot(token=telegram_token)
         self.chat_id = telegram_chat_id
         self.status_callback = status_callback
         self.exchanges = [("binance", {}), ("bybit", {}), ("okx", {})]
-        self.last_candles = None
+        self.last_candles = []
 
     def get_exchange(self, name, params):
         ex = getattr(ccxt, name)(params)
@@ -97,29 +133,30 @@ class CryptoMonitor:
 
     def fetch_candles(self, exchange, symbol):
         try:
-            import pandas as pd
-            candles = exchange.fetch_ohlcv(symbol, timeframe=TIMEFRAME, limit=5)
-            df = pd.DataFrame(candles, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
-            df['timestamp'] = pd.to_datetime(df['timestamp'], unit='ms')
-            return df
+            candles = exchange.fetch_ohlcv(symbol, timeframe=TIMEFRAME, limit=30)
+            return [
+                {
+                    "timestamp": datetime.fromtimestamp(ts / 1000),
+                    "open": op,
+                    "high": hi,
+                    "low": lo,
+                    "close": cl,
+                    "volume": vol
+                }
+                for ts, op, hi, lo, cl, vol in candles
+            ]
         except Exception as e:
             logger.error(f"OHLCV fetch failed for {symbol}: {e}")
-            return None
+            return []
 
-    def detect_green_candles(self, df):
+    def detect_green_streak(self, candles):
         green_streak = 0
-        for i in range(len(df) - 1, -1, -1):
-            if df['close'][i] > df['open'][i]:
+        for candle in reversed(candles):
+            if candle["close"] > candle["open"]:
                 green_streak += 1
             else:
                 break
-        return green_streak if MIN_GREEN_CANDLES <= green_streak <= MAX_GREEN_CANDLES else 0
-
-    def light_breakout_check(self, df):
-        current_price = df['close'].iloc[-1]
-        avg_future = df['close'].tail(3).mean()
-        increase_pct = (avg_future - current_price) / current_price
-        return increase_pct > BREAKOUT_THRESHOLD, avg_future
+        return green_streak
 
     def send_alert(self, message):
         try:
@@ -130,33 +167,57 @@ class CryptoMonitor:
     def start_monitoring(self):
         logger.info("CryptoMonitor started")
         bot_status['is_running'] = True
+
         while True:
             try:
                 exchange, tickers = self.fetch_tickers_with_fallback()
-                hot_pairs = [sym for sym, data in tickers.items()
-                             if sym.endswith('/USDT') and data.get('percentage') is not None and abs(data['percentage']) > 1]
+                # Top-N movers filter
+                candidates = [
+                    (sym, data.get('percentage', 0))
+                    for sym, data in tickers.items()
+                    if sym.endswith('/USDT')
+                ]
+                candidates.sort(key=lambda x: abs(x[1] or 0), reverse=True)
+                hot_pairs = [sym for sym, _ in candidates[:TOP_N]]
 
-                logger.info(f"Hot pairs: {len(hot_pairs)}")
+                logger.info(f"Checking {len(hot_pairs)} top USDT pairs")
+
                 for symbol in hot_pairs:
-                    df = self.fetch_candles(exchange, symbol)
-                    if df is None:
+                    candles = self.fetch_candles(exchange, symbol)
+                    if not candles:
                         continue
+                    green_streak = self.detect_green_streak(candles)
+                    if MIN_GREEN_CANDLES <= green_streak <= MAX_GREEN_CANDLES:
+                        vol_surge = calculate_volume_surge(candles)
+                        atr_now = calculate_atr(candles)
+                        atr_prev = calculate_atr(candles[:-1])
+                        rsi_now = calculate_rsi(candles)
+                        res_break = near_resistance(candles)
 
-                    green_count = self.detect_green_candles(df)
-                    if green_count > 0:
-                        is_breakout, predicted = self.light_breakout_check(df)
-                        prob = "High" if is_breakout else "Low"
-                        msg = f"{symbol}: {green_count} green candles\n" \
-                              f"Current: ${df['close'].iloc[-1]:,.2f} | Predicted: ${predicted:,.2f}\n" \
-                              f"Breakout Probability: {prob}"
+                        if vol_surge and atr_now > atr_prev and 55 < rsi_now < 75 and res_break:
+                            prob = "HIGH"
+                        else:
+                            prob = "LOW"
+
+                        msg = (f"{symbol}: {green_streak} green candles ({TIMEFRAME})\n"
+                               f"Current: ${candles[-1]['close']:,.2f}\n"
+                               f"ATR: {atr_now:.4f}, RSI: {rsi_now:.2f}\n"
+                               f"Volume Surge: {vol_surge}, Near Resistance: {res_break}\n"
+                               f"Breakout Probability: {prob}")
+
                         self.send_alert(msg)
                         with app.app_context():
-                            alert = Alert(message=msg, price=df['close'].iloc[-1], green_candles=green_count)
+                            alert = Alert(
+                                message=msg,
+                                price=candles[-1]['close'],
+                                green_candles=green_streak
+                            )
                             db.session.add(alert)
                             db.session.commit()
                         bot_status['alerts_sent'] += 1
                         bot_status['last_alert'] = msg
-                    self.last_candles = df
+
+                    self.last_candles = candles
 
                 bot_status['last_check'] = datetime.utcnow()
                 self.status_callback(bot_status)
@@ -167,11 +228,11 @@ class CryptoMonitor:
                 bot_status['errors'].append(str(e))
                 time.sleep(CHECK_INTERVAL)
 
-# --- Status callback ---
+# === Status Callback ===
 def update_status(status_update):
     bot_status.update(status_update)
 
-# --- Flask routes ---
+# === Flask Routes ===
 @app.route('/')
 def index():
     return jsonify(bot_status)
@@ -193,23 +254,22 @@ def api_alerts():
 
 @app.route('/api/price_data')
 def api_price_data():
-    if crypto_monitor and crypto_monitor.last_candles is not None:
-        df = crypto_monitor.last_candles
-        return jsonify([{
-            'timestamp': row['timestamp'].isoformat(),
-            'open': float(row['open']),
-            'high': float(row['high']),
-            'low': float(row['low']),
-            'close': float(row['close']),
-            'volume': float(row['volume'])
-        } for idx, row in df.iterrows()])
-    return jsonify([])
+    return jsonify([
+        {
+            'timestamp': row["timestamp"].isoformat(),
+            'open': float(row["open"]),
+            'high': float(row["high"]),
+            'low': float(row["low"]),
+            'close': float(row["close"]),
+            'volume': float(row["volume"])
+        } for row in crypto_monitor.last_candles
+    ]) if crypto_monitor.last_candles else jsonify([])
 
 @app.route('/ping')
 def ping():
     return "pong"
 
-# --- Start Bot ---
+# === Start Bot ===
 crypto_monitor = CryptoMonitor(
     telegram_token=TELEGRAM_TOKEN,
     telegram_chat_id=TELEGRAM_CHAT_ID,
