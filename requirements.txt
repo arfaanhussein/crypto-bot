@@ -1,7 +1,7 @@
-ccxt
-pandas
+ccxt==4.2.41
+pandas==2.1.4
 python-telegram-bot==13.15
-flask
-requests
-flask_sqlalchemy
-sqlalchemy
+flask==2.3.3
+requests==2.31.0
+flask_sqlalchemy==3.1.1
+sqlalchemy==2.0.23
