@@ -123,10 +123,8 @@ def calculate_rsi(candles, period=14):
     gains, losses = 0.0, 0.0
     for i in range(-period, 0):
         change = candles[i]["close"] - candles[i-1]["close"]
-        if change > 0:
-            gains += change
-        else:
-            losses -= change
+        gains += max(0.0, change)
+        losses += max(0.0, -change)
     if losses == 0:
         return 100.0
     rs = gains / losses
@@ -227,6 +225,73 @@ def mfi(candles, period=14):
     if neg_flow == 0: return 100.0
     mr = pos_flow / neg_flow
     return 100 - (100 / (1 + mr))
+
+# ===== tolerant uptrend helpers (allows one small red inside the run-up) =====
+def body_size(c):
+    return abs(c["close"] - c["open"])
+
+def is_green(c):
+    return c["close"] > c["open"]
+
+def tolerant_uptrend_streak(candles, max_red=1, red_max_atr_factor=0.6, atr_period=14):
+    """
+    Count a tolerant streak from the latest candle backward, allowing up to max_red small red candles
+    whose body <= red_max_atr_factor * ATR and whose close isn't much below previous close.
+    """
+    if len(candles) < atr_period + 2:
+        return 0
+    atr = calculate_atr(candles, atr_period) or 0.0
+    if atr <= 0:
+        return 0
+
+    streak = 0
+    red_used = 0
+    n = len(candles)
+    for i in range(n - 1, -1, -1):
+        c = candles[i]
+        if is_green(c):
+            streak += 1
+            continue
+        if red_used < max_red:
+            b = body_size(c)
+            prev_close = candles[i - 1]["close"] if i > 0 else c["close"]
+            if b <= red_max_atr_factor * atr and c["close"] >= prev_close * 0.995:
+                red_used += 1
+                streak += 1
+                continue
+        break
+    return streak
+
+def uptrend_cluster_ok(candles, window=8, max_red=1, min_green_ratio=0.7, min_net_gain=0.008, red_max_atr_factor=0.6):
+    """
+    In the last 'window' bars:
+      - majority green (>= min_green_ratio)
+      - net gain >= min_net_gain
+      - at most max_red red bars and red bodies small vs ATR
+    """
+    n = len(candles)
+    if n < window + 2:
+        return False
+    w = candles[-window:]
+    greens = sum(1 for c in w if is_green(c))
+    reds = window - greens
+    if reds > max_red:
+        return False
+
+    start = w[0]["close"]; end = w[-1]["close"]
+    net = (end - start) / (start if start else 1)
+    if net < min_net_gain:
+        return False
+
+    if reds > 0:
+        atr = calculate_atr(candles, 14) or 0.0
+        if atr <= 0:
+            return False
+        for c in w:
+            if not is_green(c) and body_size(c) > red_max_atr_factor * atr:
+                return False
+    return (greens / window) >= min_green_ratio
+# =============================================================================
 
 # ========= Liquidity estimation from tickers =========
 def est_quote_usd_volume(ticker: dict) -> float:
